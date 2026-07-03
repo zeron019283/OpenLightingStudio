@@ -1,50 +1,79 @@
 import threading
 import numpy as np
 import soundcard as sc
+import queue
+import time
 
 
 class AudioEngine:
 
-    def __init__(self, callback=None):
+    def __init__(self, rgb_queue):
 
-        self.callback = callback
+        # queue dari controller (ke BLE)
+        self.rgb_queue = rgb_queue
 
         self.running = False
         self.thread = None
 
-        self.speaker = None
-        self.devices = []
+        # audio config
+        self.sample_rate = 44100
+        self.block_size = 4096
 
-        self.sample_rate = 48000
-        self.block_size = 1024
+        # mic selection
+        self.mics = sc.all_microphones()
+        self.selected_mic = None
 
-        self.sensitivity = 1.2
-
+        # smoothing
         self.last_rgb = (0, 0, 0)
 
+        # throttle
+        self.last_time = 0
+
+        # sensitivity
+        self.sensitivity = 1.2
+
     # =========================
-    # DEVICE LIST
+    # MICROPHONE LIST
+    # =========================
+
+    def list_microphones(self):
+        return [m.name for m in sc.all_microphones()]
+
+    def set_microphone(self, index):
+
+        mics = sc.all_microphones()
+
+        if index < 0 or index >= len(mics):
+            return False
+
+        self.selected_mic = mics[index]
+
+        print("MIC SELECTED:", self.selected_mic.name)
+
+        return True
+
+    # =========================
+    # OUTPUT DEVICE LIST (OPTIONAL UI)
     # =========================
 
     def get_output_devices(self):
-
-        self.devices = sc.all_speakers()
-        return [d.name for d in self.devices]
-
-    def get_default_output(self):
-
-        self.speaker = sc.default_speaker()
-        return self.speaker.name
+        return [d.name for d in sc.all_speakers()]
 
     def select_output(self, index):
 
-        self.devices = sc.all_speakers()
+        speakers = sc.all_speakers()
 
-        if index < 0 or index >= len(self.devices):
+        if index < 0 or index >= len(speakers):
             return False
 
-        self.speaker = self.devices[index]
+        # hanya untuk referensi (tidak dipakai audio capture)
+        self.speaker = speakers[index]
+
         return True
+
+    def get_default_output(self):
+        self.speaker = sc.default_speaker()
+        return self.speaker.name
 
     # =========================
     # START / STOP
@@ -54,9 +83,6 @@ class AudioEngine:
 
         if self.running:
             return
-
-        if self.speaker is None:
-            self.speaker = sc.default_speaker()
 
         self.running = True
 
@@ -74,22 +100,27 @@ class AudioEngine:
             self.thread.join(timeout=1)
 
     # =========================
-    # AUDIO LOOP (WASAPI LOOPBACK)
+    # AUDIO LOOP (MIC INPUT)
     # =========================
 
     def _loop(self):
 
         try:
 
-            with self.speaker.recorder(
+            # pilih mic
+            mic = self.selected_mic if self.selected_mic else sc.default_microphone()
+
+            print("USING MIC:", mic.name)
+
+            with mic.recorder(
                 samplerate=self.sample_rate,
-                channels=2,
-                include_loopback=True
+                channels=2
             ) as rec:
 
                 while self.running:
 
                     data = rec.record(self.block_size)
+
                     self.process_audio(data)
 
         except Exception as e:
@@ -97,13 +128,21 @@ class AudioEngine:
             self.running = False
 
     # =========================
-    # PROCESS AUDIO
+    # AUDIO PROCESS (FFT + RGB)
     # =========================
 
     def process_audio(self, data):
 
         if data is None or len(data) == 0:
             return
+
+        now = time.time()
+
+        # throttle (anti lag + fix discontinuity)
+        if now - self.last_time < 0.03:
+            return
+
+        self.last_time = now
 
         # stereo -> mono
         mono = np.mean(data, axis=1)
@@ -112,45 +151,44 @@ class AudioEngine:
         fft = np.abs(np.fft.rfft(mono))
         freqs = np.fft.rfftfreq(len(mono), 1 / self.sample_rate)
 
-        bass = self._band_energy(freqs, fft, 20, 250)
-        mid = self._band_energy(freqs, fft, 250, 4000)
-        treble = self._band_energy(freqs, fft, 4000, 16000)
+        bass = self._band(freqs, fft, 20, 250)
+        mid = self._band(freqs, fft, 250, 4000)
+        treble = self._band(freqs, fft, 4000, 16000)
 
-        r, g, b = self.map_to_rgb(bass, mid, treble)
+        r, g, b = self._map_rgb(bass, mid, treble)
 
-        rgb = (r, g, b)
+        # smoothing (anti flicker)
+        r = int(self.last_rgb[0] * 0.7 + r * 0.3)
+        g = int(self.last_rgb[1] * 0.7 + g * 0.3)
+        b = int(self.last_rgb[2] * 0.7 + b * 0.3)
 
-        # anti spam
-        if rgb == self.last_rgb:
-            return
+        self.last_rgb = (r, g, b)
 
-        self.last_rgb = rgb
-
-        if self.callback:
-            self.callback(r, g, b)
+        # push ke queue (NON-BLOCKING)
+        try:
+            self.rgb_queue.put_nowait((r, g, b))
+        except:
+            pass
 
     # =========================
-    # FREQUENCY BANDS
+    # FREQUENCY BAND
     # =========================
 
-    def _band_energy(self, freqs, fft, low, high):
+    def _band(self, freqs, fft, low, high):
 
         idx = np.where((freqs >= low) & (freqs <= high))[0]
 
         if len(idx) == 0:
             return 0
 
-        value = np.mean(fft[idx])
-
-        return value
+        return np.mean(fft[idx])
 
     # =========================
     # RGB MAPPING
     # =========================
 
-    def map_to_rgb(self, bass, mid, treble):
+    def _map_rgb(self, bass, mid, treble):
 
-        # normalize
         bass = min(bass * self.sensitivity / 1000, 1.0)
         mid = min(mid * self.sensitivity / 1000, 1.0)
         treble = min(treble * self.sensitivity / 1000, 1.0)
@@ -160,11 +198,3 @@ class AudioEngine:
         b = int(treble * 255)
 
         return r, g, b
-
-    # =========================
-    # SETTINGS
-    # =========================
-
-    def set_sensitivity(self, value):
-
-        self.sensitivity = value

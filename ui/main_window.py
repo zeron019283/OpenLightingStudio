@@ -1,6 +1,8 @@
 import customtkinter as ctk
 import threading
 import asyncio
+import time
+import queue
 
 from app.controller import LightingController
 
@@ -11,6 +13,12 @@ class MainWindow(ctk.CTk):
         super().__init__()
 
         self.controller = LightingController()
+        self.last_send = 0
+
+        # ===== RGB QUEUE SYSTEM (FIX SLIDER) =====
+        self.rgb_queue = queue.Queue()
+        self.rgb_worker_running = True
+        threading.Thread(target=self.rgb_worker, daemon=True).start()
 
         self.title("OpenLighting Studio")
         self.geometry("950x700")
@@ -19,23 +27,81 @@ class MainWindow(ctk.CTk):
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
-        # BUILD UI
         self.build_ui()
         self.build_controls()
+
+        self.music_btn = ctk.CTkButton(
+            self,
+            text="MUSIC MODE",
+            command=self.controller.start_music_mode
+        )
+        self.music_btn.pack(pady=10)
+
+        # ===== RGB SLIDERS =====
+        self.rgb_frame = ctk.CTkFrame(self)
+        self.rgb_frame.pack(pady=10)
+
+        # RED
+        self.red_slider = ctk.CTkSlider(
+            self.rgb_frame,
+            from_=0,
+            to=255,
+            command=self.update_rgb
+        )
+        self.red_slider.grid(row=0, column=0, padx=10)
+        self.red_slider.set(0)
+        ctk.CTkLabel(self.rgb_frame, text="R").grid(row=1, column=0)
+
+        # GREEN
+        self.green_slider = ctk.CTkSlider(
+            self.rgb_frame,
+            from_=0,
+            to=255,
+            command=self.update_rgb
+        )
+        self.green_slider.grid(row=0, column=1, padx=10)
+        self.green_slider.set(0)
+        ctk.CTkLabel(self.rgb_frame, text="G").grid(row=1, column=1)
+
+        # BLUE
+        self.blue_slider = ctk.CTkSlider(
+            self.rgb_frame,
+            from_=0,
+            to=255,
+            command=self.update_rgb
+        )
+        self.blue_slider.grid(row=0, column=2, padx=10)
+        self.blue_slider.set(0)
+        ctk.CTkLabel(self.rgb_frame, text="B").grid(row=1, column=2)
+
+    # =========================
+    # RGB WORKER (FIX INTI)
+    # =========================
+    def rgb_worker(self):
+        while self.rgb_worker_running:
+            try:
+                r, g, b = self.rgb_queue.get(timeout=0.1)
+                asyncio.run(self.controller.set_rgb(r, g, b))
+            except queue.Empty:
+                continue
+
+    # =========================
+    # SAFE LOG (THREAD SAFE)
+    # =========================
+    def safe_log(self, text: str):
+        self.log.after(0, lambda: self.log.insert("end", text + "\n"))
 
     # =========================
     # UI
     # =========================
     def build_ui(self):
 
-        # TITLE
         ctk.CTkLabel(
             self,
             text="OpenLighting Studio",
             font=("Segoe UI", 24, "bold")
         ).pack(pady=10)
 
-        # STATUS
         self.status_label = ctk.CTkLabel(
             self,
             text="🔴 DISCONNECTED",
@@ -43,7 +109,6 @@ class MainWindow(ctk.CTk):
         )
         self.status_label.pack()
 
-        # DEVICE COMBO
         self.device_combo = ctk.CTkComboBox(
             self,
             values=["Belum Scan"],
@@ -51,7 +116,6 @@ class MainWindow(ctk.CTk):
         )
         self.device_combo.pack(pady=10)
 
-        # TOP BUTTON FRAME
         frame = ctk.CTkFrame(self)
         frame.pack(pady=10)
 
@@ -75,16 +139,11 @@ class MainWindow(ctk.CTk):
         )
         self.disconnect_btn.grid(row=0, column=2, padx=5)
 
-        # LOG BOX
-        self.log = ctk.CTkTextbox(
-            self,
-            width=800,
-            height=400
-        )
+        self.log = ctk.CTkTextbox(self, width=800, height=400)
         self.log.pack(pady=20)
 
     # =========================
-    # CONTROL BUTTONS
+    # CONTROLS
     # =========================
     def build_controls(self):
 
@@ -127,6 +186,24 @@ class MainWindow(ctk.CTk):
         self.blue_btn.grid(row=1, column=2, padx=5)
 
     # =========================
+    # SLIDER FIX (INI YANG PENTING)
+    # =========================
+    def update_rgb(self, value=None):
+
+        r = int(self.red_slider.get())
+        g = int(self.green_slider.get())
+        b = int(self.blue_slider.get())
+
+        # buang queue lama (biar cuma latest value yang dikirim)
+        while not self.rgb_queue.empty():
+            try:
+                self.rgb_queue.get_nowait()
+            except:
+                break
+
+        self.rgb_queue.put((r, g, b))
+
+    # =========================
     # THREAD WRAPPERS
     # =========================
     def _on_thread(self): asyncio.run(self.controller.on())
@@ -152,22 +229,21 @@ class MainWindow(ctk.CTk):
 
     async def scan(self):
 
-        self.log.insert("end", "Scanning Bluetooth...\n")
+        self.safe_log("Scanning Bluetooth...")
 
         devices = await self.controller.scan()
 
         names = []
 
         for d in devices:
-            line = f'{d["name"]} | {d["address"]} ({d["mode"]})'
+            self.safe_log(f'{d["name"]} | {d["address"]} ({d["mode"]})')
             names.append(f'{d["name"]} ({d["mode"]})')
-            self.log.insert("end", line + "\n")
 
         if names:
             self.device_combo.configure(values=names)
             self.device_combo.set(names[0])
 
-        self.log.insert("end", "\nSCAN SELESAI\n")
+        self.safe_log("SCAN SELESAI")
 
     # =========================
     # CONNECT
@@ -181,12 +257,12 @@ class MainWindow(ctk.CTk):
     async def connect(self):
 
         try:
-            self.log.insert("end", "Connecting...\n")
+            self.safe_log("Connecting...")
 
             selected = self.device_combo.get()
 
             if not selected or selected == "Belum Scan":
-                self.log.insert("end", "No device selected!\n")
+                self.safe_log("No device selected!")
                 return
 
             index = self.device_combo.cget("values").index(selected)
@@ -194,10 +270,10 @@ class MainWindow(ctk.CTk):
             result = await self.controller.connect(index)
 
             if result:
-                self.log.insert("end", "CONNECTED SUCCESS\n")
+                self.safe_log("CONNECTED SUCCESS")
                 self.status_ok()
             else:
-                self.log.insert("end", "CONNECT FAILED\n")
+                self.safe_log("CONNECT FAILED")
 
         except Exception as e:
-            self.log.insert("end", f"ERROR: {e}\n")
+            self.safe_log(f"ERROR: {e}")
